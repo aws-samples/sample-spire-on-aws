@@ -7,7 +7,7 @@ This repository contains the infrastructure and Kubernetes manifests for deployi
 
 [SPIRE](https://spiffe.io/docs/latest/spire-about/) is the reference implementation of the [SPIFFE](https://spiffe.io/) (Secure Production Identity Framework for Everyone) specification, providing cryptographic workload identities to software systems in dynamic and heterogeneous environments. By default, SPIRE handles key management, data storage, certificate authority, and trust bundle distribution internally. 
 
-A sample workload is included that displays the workload's SPIFFE identity (X.509 and JWT SVIDs) and demonstrates the end-to-end authorization flow through API Gateway and Verified Permissions. The stack will provision a Cognito User Pool and test user to access the web application.
+A sample workload is provisioned that displays the workload's SPIFFE identity (X.509 and JWT SVIDs) and demonstrates the end-to-end authorization flow through API Gateway and Verified Permissions. The stack will provision also provision a Cognito User Pool and test user to access the web application in addition to the infrastructure supporting the SPIRE system.
 
 
 ## What it does
@@ -21,7 +21,7 @@ The default SPIRE deployment handles key management, data storage, and certifica
 | Certificate Authority | AWS Private CA | HSM-backed root of trust, managed CRL/OCSP |
 | Trust Bundle Publisher | Amazon S3 + CloudFront | Global bundle distribution decoupled from SPIRE server |
 | SVID Store (Agent) | AWS Secrets Manager | Push SVIDs to serverless/ephemeral workloads |
-| Authorization | Amazon Verified Permissions + AWS WAF | Fine-grained Cedar policies for SPIFFE identities, with WAF rate limiting on the API |
+
 
 ![Architecture](images/Architecture.png)
 
