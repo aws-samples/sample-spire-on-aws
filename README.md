@@ -3,14 +3,12 @@
 
 > **Note:** This project is for demonstration purposes only and is not intended for production use. It is designed to show how you can leverage AWS managed services when running SPIRE on AWS.
 
-
-[SPIRE](https://spiffe.io/docs/latest/spire-about/) is the reference implementation of the [SPIFFE](https://spiffe.io/) (Secure Production Identity Framework for Everyone) specification, providing cryptographic workload identities to software systems in dynamic and heterogeneous environments. By default, SPIRE handles key management, data storage, certificate authority, and trust bundle distribution internally. While this works for getting started, production deployments benefit from offloading these functions to managed services that provide higher availability, durability, and security.
-
-This sample deploys a complete SPIRE infrastructure on Amazon EKS and replaces the default SPIRE components with AWS managed services — AWS KMS for key management, Amazon Aurora PostgreSQL for the datastore, AWS Private CA for the certificate authority, Amazon S3 and CloudFront for trust bundle distribution, and AWS Secrets Manager for SVID storage. It also demonstrates fine-grained workload authorization using Amazon Verified Permissions with Cedar policies evaluated against SPIFFE identities.
-
-A sample web application is included that displays the workload's SPIFFE identity (X.509 and JWT SVIDs) and demonstrates the end-to-end authorization flow through API Gateway and Verified Permissions.
-
 This repository contains the infrastructure and Kubernetes manifests for deploying [SPIRE](https://spiffe.io/docs/latest/spire-about/) on Amazon EKS with AWS managed service integrations.
+
+[SPIRE](https://spiffe.io/docs/latest/spire-about/) is the reference implementation of the [SPIFFE](https://spiffe.io/) (Secure Production Identity Framework for Everyone) specification, providing cryptographic workload identities to software systems in dynamic and heterogeneous environments. By default, SPIRE handles key management, data storage, certificate authority, and trust bundle distribution internally. 
+
+A sample workload is included that displays the workload's SPIFFE identity (X.509 and JWT SVIDs) and demonstrates the end-to-end authorization flow through API Gateway and Verified Permissions. The stack will provision a Cognito User Pool and test user to access the web application.
+
 
 ## What it does
 
