@@ -1,0 +1,1465 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'EKS cluster with SPIFFE/SPIRE infrastructure (VPC, EKS, S3/CloudFront, PCA, RDS, Verified Permissions, API Gateway)'
+
+Parameters:
+  KubernetesOperatorRoleArn:
+    Type: String
+    Description: ARN of the IAM role that should have admin access to the EKS cluster
+    Default: ''
+  DeployPCA:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create the AWS Private CA resources
+  DeployRDS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to create the Aurora PostgreSQL RDS resources
+  DemoUserEmail:
+    Type: String
+    Description: Email address for the auto-created Cognito demo user
+    AllowedPattern: '^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+    ConstraintDescription: Must be a valid email address
+
+Conditions:
+  HasKubernetesOperator: !Not [!Equals [!Ref KubernetesOperatorRoleArn, '']]
+  ShouldDeployPCA: !Equals [!Ref DeployPCA, 'true']
+  ShouldDeployRDS: !Equals [!Ref DeployRDS, 'true']
+
+Mappings:
+  ServicePrincipalPartitionMap:
+    aws:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+      IRA: rolesanywhere.amazonaws.com
+      SSM: ssm.amazonaws.com
+    aws-cn:
+      EC2: ec2.amazonaws.com.cn
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-iso:
+      EC2: ec2.c2s.ic.gov
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-iso-b:
+      EC2: ec2.sc2s.sgov.gov
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-iso-e:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-iso-f:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+    aws-us-gov:
+      EC2: ec2.amazonaws.com
+      EKS: eks.amazonaws.com
+      EKSFargatePods: eks-fargate-pods.amazonaws.com
+      IRA: rolesanywhere.amazonaws.com
+      SSM: ssm.amazonaws.com
+Resources:
+  RootCA:
+    Type: AWS::ACMPCA::CertificateAuthority
+    Condition: ShouldDeployPCA
+    Properties:
+      Type: ROOT
+      SigningAlgorithm: SHA256WITHECDSA
+      UsageMode: SHORT_LIVED_CERTIFICATE
+      Subject:
+        CommonName: ROOT SPIRE CA
+        Country: US
+        Organization: SPIRE
+        OrganizationalUnit: Engineering
+        State: Washington
+      KeyAlgorithm: EC_prime256v1
+  AutoModeNodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap
+                  - ServicePrincipalPartitionMap
+                  - !Ref 'AWS::Partition'
+                  - EC2
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryPullOnly'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodeMinimalPolicy'
+      Policies:
+        - PolicyName: ScopedSecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}-*'
+
+  ClusterSharedNodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Communication between all nodes in the cluster
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ClusterSharedNodeSecurityGroup'
+      VpcId: !Ref 'VPC'
+  EKSSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for EKS Kubernetes secrets encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:${AWS::Partition}:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowEKSServiceRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt ServiceRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/EKSSecretsKey'
+  ControlPlane:
+    Type: AWS::EKS::Cluster
+    Properties:
+      AccessConfig:
+        AuthenticationMode: API_AND_CONFIG_MAP
+        BootstrapClusterCreatorAdminPermissions: true
+      BootstrapSelfManagedAddons: false
+      KubernetesNetworkConfig:
+        IpFamily: ipv4
+        ElasticLoadBalancing:
+          Enabled: true
+      ComputeConfig:
+        Enabled: true
+        NodeRoleArn: !GetAtt 'AutoModeNodeRole.Arn'
+        NodePools:
+          - general-purpose
+          - system
+      StorageConfig:
+        BlockStorage:
+          Enabled: true
+      Name: aws-spire-cluster
+      ResourcesVpcConfig:
+        EndpointPrivateAccess: false
+        EndpointPublicAccess: true
+        SecurityGroupIds:
+          - !Ref 'ControlPlaneSecurityGroup'
+        SubnetIds:
+          - !Ref 'SubnetPrivateAZ2'
+          - !Ref 'SubnetPrivateAZ1'
+      RoleArn: !GetAtt 'ServiceRole.Arn'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlane'
+      Version: '1.30'
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig:
+        - Provider:
+            KeyArn: !GetAtt EKSSecretsKey.Arn
+          Resources:
+            - secrets
+  ControlPlaneSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Communication between the control plane and worker nodegroups
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound traffic
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ControlPlaneSecurityGroup'
+      VpcId: !Ref 'VPC'
+  IngressDefaultClusterToNodeSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow managed and unmanaged nodes to communicate with each other
+        (all ports)
+      GroupId: !Ref 'ClusterSharedNodeSecurityGroup'
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !GetAtt 'ControlPlane.ClusterSecurityGroupId'
+      ToPort: 65535
+  IngressInterNodeGroupSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow nodes to communicate with each other (all ports)
+      GroupId: !Ref 'ClusterSharedNodeSecurityGroup'
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref 'ClusterSharedNodeSecurityGroup'
+      ToPort: 65535
+  IngressNodeToDefaultClusterSG:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      Description: Allow unmanaged nodes to communicate with control plane (all ports)
+      GroupId: !GetAtt 'ControlPlane.ClusterSecurityGroupId'
+      IpProtocol: '-1'
+      SourceSecurityGroupId: !Ref 'ClusterSharedNodeSecurityGroup'
+      ToPort: 65535
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/InternetGateway'
+  NATGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt 'NATIP.AllocationId'
+      SubnetId: !Ref 'SubnetPublicAZ1'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/NATGateway'
+  NATIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/NATIP'
+  NATPrivateSubnetRouteAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref 'NATGateway'
+      RouteTableId: !Ref 'PrivateRouteTableAZ2'
+  NATPrivateSubnetRouteAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      NatGatewayId: !Ref 'NATGateway'
+      RouteTableId: !Ref 'PrivateRouteTableAZ1'
+  PrivateRouteTableAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/PrivateRouteTableAZ2'
+      VpcId: !Ref 'VPC'
+  PrivateRouteTableAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/PrivateRouteTableAZ1'
+      VpcId: !Ref 'VPC'
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/PublicRouteTable'
+      VpcId: !Ref 'VPC'
+  PublicSubnetRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      DestinationCidrBlock: '0.0.0.0/0'
+      GatewayId: !Ref 'InternetGateway'
+      RouteTableId: !Ref 'PublicRouteTable'
+    DependsOn:
+      - VPCGatewayAttachment
+  RouteTableAssociationPrivateAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref 'PrivateRouteTableAZ2'
+      SubnetId: !Ref 'SubnetPrivateAZ2'
+  RouteTableAssociationPrivateAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref 'PrivateRouteTableAZ1'
+      SubnetId: !Ref 'SubnetPrivateAZ1'
+  RouteTableAssociationPublicAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      SubnetId: !Ref 'SubnetPublicAZ2'
+  RouteTableAssociationPublicAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref 'PublicRouteTable'
+      SubnetId: !Ref 'SubnetPublicAZ1'
+  ServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+              - sts:TagSession
+            Effect: Allow
+            Principal:
+              Service:
+                - !FindInMap
+                  - ServicePrincipalPartitionMap
+                  - !Ref 'AWS::Partition'
+                  - EKS
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSVPCResourceController'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSComputePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSBlockStoragePolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSLoadBalancingPolicy'
+        - !Sub 'arn:${AWS::Partition}:iam::aws:policy/AmazonEKSNetworkingPolicy'
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/ServiceRole'
+  SubnetPrivateAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 192.168.96.0/19
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/SubnetPrivateAZ2'
+      VpcId: !Ref 'VPC'
+  SubnetPrivateAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 192.168.64.0/19
+      Tags:
+        - Key: kubernetes.io/role/internal-elb
+          Value: '1'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/SubnetPrivateAZ1'
+      VpcId: !Ref 'VPC'
+  SubnetPublicAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [1, !GetAZs '']
+      CidrBlock: 192.168.32.0/19
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/SubnetPublicAZ2'
+      VpcId: !Ref 'VPC'
+  SubnetPublicAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      AvailabilityZone: !Select [0, !GetAZs '']
+      CidrBlock: 192.168.0.0/19
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: kubernetes.io/role/elb
+          Value: '1'
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/SubnetPublicAZ1'
+      VpcId: !Ref 'VPC'
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 192.168.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub '${AWS::StackName}/VPC'
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref 'InternetGateway'
+      VpcId: !Ref 'VPC'
+  KubernetesOperatorAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasKubernetesOperator
+    Properties:
+      ClusterName: !Ref ControlPlane
+      PrincipalArn: !Ref KubernetesOperatorRoleArn
+      AccessPolicies:
+        - PolicyArn: !Sub 'arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy'
+          AccessScope:
+            Type: 'cluster'
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub trust-bundle-bucket-${AWS::AccountId}-${AWS::Region}
+      AccessControl: Private
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+  CloudFrontOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-${AWS::Region}-OAC
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  ContentBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${ContentBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: '*'
+            Action: 's3:*'
+            Resource:
+              - !Sub ${ContentBucket.Arn}
+              - !Sub ${ContentBucket.Arn}/*
+            Condition:
+              Bool:
+                aws:SecureTransport: 'false'
+
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''
+            OriginAccessControlId: !GetAtt CloudFrontOriginAccessControl.Id
+        Enabled: true
+        DefaultRootObject: index.html
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad  # CachingDisabled policy ID
+          OriginRequestPolicyId: 88a5eaf4-2fd4-4709-b370-b4c650ea3fcf  # CORS-S3Origin policy ID
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.3_2025
+  SpireServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'spire-server-role-${AWS::StackName}'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: pods.eks.amazonaws.com
+            Action:
+              - sts:AssumeRole
+              - sts:TagSession
+      ManagedPolicyArns: []
+      Policies:
+        - PolicyName: SpireServerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: S3BundlePublisher
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                Resource: !Sub 'arn:aws:s3:::trust-bundle-bucket-${AWS::AccountId}-${AWS::Region}/*'
+              - Sid: S3BundleBucketList
+                Effect: Allow
+                Action:
+                  - s3:ListBucket
+                Resource: !Sub 'arn:aws:s3:::trust-bundle-bucket-${AWS::AccountId}-${AWS::Region}'
+              - Sid: KMSKeyManagement
+                Effect: Allow
+                Action:
+                  - kms:CreateKey
+                  - kms:CreateGrant
+                  - kms:Sign
+                  - kms:GetPublicKey
+                  - kms:DescribeKey
+                  - kms:ListKeys
+                  - kms:ScheduleKeyDeletion
+                  - kms:CreateAlias
+                  - kms:UpdateAlias
+                  - kms:ListAliases
+                  - kms:PutKeyPolicy
+                  - kms:GetKeyPolicy
+                  - kms:TagResource
+                Resource: '*'
+              - Sid: RDSDataAPI
+                Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                  - rds-data:BatchExecuteStatement
+                Resource: '*'
+              - Sid: RDSIAMConnect
+                Effect: Allow
+                Action:
+                  - rds-db:connect
+                Resource: !Sub 'arn:aws:rds-db:${AWS::Region}:${AWS::AccountId}:*'
+              - Sid: PCAAccess
+                Effect: Allow
+                Action:
+                  - acm-pca:IssueCertificate
+                  - acm-pca:GetCertificate
+                  - acm-pca:GetCertificateAuthorityCertificate
+                  - acm-pca:DescribeCertificateAuthority
+                Resource: '*'
+              - Sid: SecretsManagerSVIDStore
+                Effect: Allow
+                Action:
+                  - secretsmanager:CreateSecret
+                  - secretsmanager:UpdateSecret
+                  - secretsmanager:PutSecretValue
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DeleteSecret
+                  - secretsmanager:DescribeSecret
+                Resource:
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${AWS::StackName}-*'
+                  - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:spire-*'
+              - Sid: SecretsManagerList
+                Effect: Allow
+                Action:
+                  - secretsmanager:ListSecrets
+                Resource: '*'
+
+  SpireServerPodIdentityAssociation:
+    Type: AWS::EKS::PodIdentityAssociation
+    Properties:
+      ClusterName: !Ref ControlPlane
+      Namespace: spire-system
+      ServiceAccount: spire-server
+      RoleArn: !GetAtt SpireServerRole.Arn
+    DependsOn: ControlPlane
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Condition: ShouldDeployRDS
+    Properties:
+      DBSubnetGroupDescription: Aurora PostgreSQL Subnet Group
+      SubnetIds:
+        - !Ref SubnetPrivateAZ1
+        - !Ref SubnetPrivateAZ2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/AuroraDBSubnetGroup
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Condition: ShouldDeployRDS
+    Properties:
+      GroupDescription: Allow Aurora PostgreSQL access from EKS nodes
+      VpcId: !Ref VPC
+      SecurityGroupEgress:
+        - IpProtocol: '-1'
+          CidrIp: '0.0.0.0/0'
+          Description: Allow all outbound traffic
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref ClusterSharedNodeSecurityGroup
+          Description: PostgreSQL access from EKS worker nodes
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !GetAtt ControlPlane.ClusterSecurityGroupId
+          Description: PostgreSQL access from EKS control plane
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/AuroraSecurityGroup
+  AuroraPostgresCluster:
+    Type: AWS::RDS::DBCluster
+    Condition: ShouldDeployRDS
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: '16.6'
+      MasterUsername: masteruser
+      ManageMasterUserPassword: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      BackupRetentionPeriod: 7
+      EnableIAMDatabaseAuthentication: true
+      EnableHttpEndpoint: true
+      DeletionProtection: true
+      StorageEncrypted: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/AuroraPostgresCluster
+
+  AuroraPostgresInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: ShouldDeployRDS
+    DependsOn: AuroraPostgresCluster
+    Properties:
+      DBClusterIdentifier: !Ref AuroraPostgresCluster
+      DBInstanceClass: db.serverless # Choose a supported instance type
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${AWS::StackName}/AuroraPostgresWriter
+
+  # Amazon Verified Permissions Policy Store
+  FGACPolicyStore:
+    Type: AWS::VerifiedPermissions::PolicyStore
+    Properties:
+      ValidationSettings:
+        Mode: STRICT
+      Schema:
+        CedarJson: '{"SpireApp":{"entityTypes":{"Workload":{"shape":{"type":"Record","attributes":{"spiffeId":{"type":"String","required":true},"sub":{"type":"String","required":true}}}},"Order":{"shape":{"type":"Record","attributes":{"Quantity":{"type":"Long","required":false},"Owner":{"type":"String","required":false}}}}},"actions":{"CreateOrder":{"appliesTo":{"principalTypes":["Workload"],"resourceTypes":["Order"],"context":{"type":"Record","attributes":{"sub":{"type":"String"},"aud":{"type":"String"}}}}},"UpdateOrder":{"appliesTo":{"principalTypes":["Workload"],"resourceTypes":["Order"],"context":{"type":"Record","attributes":{"sub":{"type":"String"},"aud":{"type":"String"}}}}},"DescribeOrder":{"appliesTo":{"principalTypes":["Workload"],"resourceTypes":["Order"],"context":{"type":"Record","attributes":{"sub":{"type":"String"},"aud":{"type":"String"}}}}},"DeleteOrder":{"appliesTo":{"principalTypes":["Workload"],"resourceTypes":["Order"],"context":{"type":"Record","attributes":{"sub":{"type":"String"},"aud":{"type":"String"}}}}}}}}'
+
+  # Default policy allowing sample app workloads to describe orders
+  DefaultSpirePolicy:
+    Type: AWS::VerifiedPermissions::Policy
+    Properties:
+      PolicyStoreId: !GetAtt FGACPolicyStore.PolicyStoreId
+      Definition:
+        Static:
+          Description: Forbid requests from our SPIFFE workloads
+          Statement: |
+            forbid(
+              principal,
+              action,
+              resource
+            )
+            when {
+              principal has sub &&
+              principal.sub like "spiffe://example.org/*"
+            };
+
+  # IAM Role for Lambda Authorizer
+  AuthorizerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub lambda.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VerifiedPermissionsAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - verifiedpermissions:IsAuthorized
+                  - verifiedpermissions:IsAuthorizedWithToken
+                Resource: !GetAtt FGACPolicyStore.Arn
+      Tags:
+        - Key: Name
+          Value: spire-authorizer-role
+
+  # IAM Role for Backend Lambda
+  BackendLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: !Sub lambda.${AWS::URLSuffix}
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Name
+          Value: spire-backend-role
+
+  # CloudWatch Log Groups for Lambda functions
+  AuthorizerFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-authorizer
+      RetentionInDays: 90
+
+  BackendFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${AWS::StackName}-backend
+      RetentionInDays: 90
+
+  # Lambda Authorizer Function
+  AuthorizerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-authorizer
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt AuthorizerLambdaRole.Arn
+      Environment:
+        Variables:
+          CLOUDFRONT_DOMAIN: !GetAtt CloudFrontDistribution.DomainName
+          OPENID_CONFIG_URL: !Sub https://${CloudFrontDistribution.DomainName}/.well-known/openid-configuration
+          JWKS_URI: !Sub https://${CloudFrontDistribution.DomainName}/example.org
+          POLICY_STORE_ID: !GetAtt FGACPolicyStore.PolicyStoreId
+          TRUST_DOMAIN: "example.org"
+          IDENTITY_SOURCE_ID: "placeholder"
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          from botocore.exceptions import ClientError
+
+          # Initialize AWS clients
+          avp_client = boto3.client('verifiedpermissions')
+
+          # Environment variables
+          POLICY_STORE_ID = os.environ.get('POLICY_STORE_ID', 'placeholder')
+          IDENTITY_SOURCE_ID = os.environ.get('IDENTITY_SOURCE_ID', 'placeholder')
+
+          def lambda_handler(event, context):
+              """
+              Lambda authorizer that validates JWT SVID and checks Amazon Verified Permissions
+              """
+              print(f"Authorizer event: {json.dumps(event)}")
+              
+              # Extract the authorization token
+              token = event.get('authorizationToken', '')
+              method_arn = event['methodArn']
+              
+              # Check if Bearer token exists
+              if not token.startswith('Bearer '):
+                  print("No Bearer token found - denying access")
+                  return generate_policy('anonymous', 'Deny', method_arn, {
+                      'authenticated': 'false',
+                      'error': 'Missing Bearer token'
+                  })
+              
+              # Extract JWT from Bearer token
+              jwt_token = token.replace('Bearer ', '').strip()
+              
+              try:
+                  # Call Amazon Verified Permissions IsAuthorizedWithToken
+                  print(f"Calling AVP IsAuthorizedWithToken for policy store: {POLICY_STORE_ID}")
+                  print(f"Using Identity Source: {IDENTITY_SOURCE_ID}")
+                  
+                  response = avp_client.is_authorized_with_token(
+                      policyStoreId=POLICY_STORE_ID,
+                      identityToken=jwt_token,
+                      action={
+                          'actionType': 'SpireApp::Action',
+                          'actionId': 'DescribeOrder'
+                      },
+                      resource={
+                          'entityType': 'SpireApp::Order',
+                          'entityId': 'order-123'
+                      }
+                  )
+                  
+                  print(f"AVP Response: {json.dumps(response, default=str)}")
+                  
+                  # Check authorization decision
+                  decision = response.get('decision', 'DENY')
+                  
+                  if decision == 'ALLOW':
+                      print("Authorization ALLOWED by Amazon Verified Permissions")
+                      
+                      # Extract principal from response
+                      principal = response.get('principal', {})
+                      principal_id = principal.get('entityId', 'unknown')
+                      
+                      return generate_policy(principal_id, 'Allow', method_arn, {
+                          'authenticated': 'true',
+                          'spiffeId': principal_id,
+                          'avpDecision': decision,
+                          'policyStoreId': POLICY_STORE_ID
+                      })
+                  else:
+                      print(f"Authorization DENIED by Amazon Verified Permissions: {decision}")
+                      
+                      # Get determining policies if available
+                      determining_policies = response.get('determiningPolicies', [])
+                      errors = response.get('errors', [])
+                      
+                      return generate_policy('denied', 'Deny', method_arn, {
+                          'authenticated': 'true',
+                          'avpDecision': decision,
+                          'reason': 'Policy evaluation denied access',
+                          'errors': json.dumps(errors) if errors else 'No errors'
+                      })
+                      
+              except ClientError as e:
+                  error_code = e.response['Error']['Code']
+                  error_message = e.response['Error']['Message']
+                  
+                  print(f"AWS Error: {error_code} - {error_message}")
+                  
+                  # Handle specific error cases
+                  if error_code == 'ValidationException':
+                      return generate_policy('error', 'Deny', method_arn, {
+                          'authenticated': 'false',
+                          'error': 'Invalid token format',
+                          'details': error_message
+                      })
+                  elif error_code == 'ResourceNotFoundException':
+                      return generate_policy('error', 'Deny', method_arn, {
+                          'authenticated': 'false',
+                          'error': 'Policy store or identity source not found',
+                          'details': error_message
+                      })
+                  else:
+                      return generate_policy('error', 'Deny', method_arn, {
+                          'authenticated': 'false',
+                          'error': f'Authorization error: {error_code}',
+                          'details': error_message
+                      })
+                      
+              except Exception as e:
+                  print(f"Unexpected error: {str(e)}")
+                  return generate_policy('error', 'Deny', method_arn, {
+                      'authenticated': 'false',
+                      'error': 'Internal authorization error',
+                      'details': str(e)
+                  })
+
+
+          def generate_policy(principal_id, effect, resource, context=None):
+              """
+              Generate IAM policy document for API Gateway
+              """
+              auth_response = {
+                  'principalId': principal_id
+              }
+              
+              if effect and resource:
+                  policy_document = {
+                      'Version': '2012-10-17',
+                      'Statement': [
+                          {
+                              'Action': 'execute-api:Invoke',
+                              'Effect': effect,
+                              'Resource': resource
+                          }
+                      ]
+                  }
+                  auth_response['policyDocument'] = policy_document
+              
+              # Add context if provided (must be string values only)
+              if context:
+                  # Convert all context values to strings
+                  string_context = {k: str(v) for k, v in context.items()}
+                  auth_response['context'] = string_context
+              else:
+                  auth_response['context'] = {
+                      'authenticated': 'false'
+                  }
+              
+              print(f"Generated policy: {json.dumps(auth_response)}")
+              return auth_response
+      Description: Lambda authorizer that validates JWT SVIDs and checks Verified Permissions
+      Timeout: 30
+      Tags:
+        - Key: Name
+          Value: spire-authorizer
+
+  # Backend Lambda Function
+  BackendFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-backend
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Role: !GetAtt BackendLambdaRole.Arn
+      Code:
+        ZipFile: |
+          import json
+          
+          def lambda_handler(event, context):
+              print(f"Backend event: {json.dumps(event)}")
+              
+              # Extract authorization context
+              authorizer_context = event.get('requestContext', {}).get('authorizer', {})
+              spiffe_id = authorizer_context.get('spiffeId', 'unknown')
+              authenticated = authorizer_context.get('authenticated', 'false')
+              
+              return {
+                  'statusCode': 200,
+                  'headers': {
+                      'Content-Type': 'application/json',
+                      'Access-Control-Allow-Origin': '*'
+                  },
+                  'body': json.dumps({
+                      'message': 'Congratulations! You have completed the Fine-Grained Authorization module!',
+                      'authenticated': authenticated,
+                      'spiffeId': spiffe_id,
+                      'details': {
+                          'jwtVerified': 'JWT SVID signature verified using SPIFFE trust bundle',
+                          'authorizationChecked': 'Amazon Verified Permissions policy evaluated',
+                          'policyDecision': 'ALLOW - workload authorized to access this resource'
+                      }
+                  })
+              }
+      Description: Backend function for SPIRE authorization demo
+      Timeout: 10
+      Tags:
+        - Key: Name
+          Value: spire-backend
+
+  # API Gateway REST API
+  SpireApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: spire-api
+      Description: API Gateway for SPIRE Authorization Module
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # Lambda Authorizer
+  ApiAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      Name: spire-authorizer
+      Type: TOKEN
+      AuthorizerUri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AuthorizerFunction.Arn}/invocations
+      AuthorizerResultTtlInSeconds: 0
+      IdentitySource: method.request.header.Authorization
+      RestApiId: !Ref SpireApi
+
+  # API Gateway Resource
+  CompletionResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref SpireApi
+      ParentId: !GetAtt SpireApi.RootResourceId
+      PathPart: fgac
+
+  # API Gateway Method
+  CompletionMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SpireApi
+      ResourceId: !Ref CompletionResource
+      HttpMethod: GET
+      AuthorizationType: CUSTOM
+      AuthorizerId: !Ref ApiAuthorizer
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${BackendFunction.Arn}/invocations
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: Empty
+
+  # OPTIONS method for CORS
+  CompletionOptionsMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref SpireApi
+      ResourceId: !Ref CompletionResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ''
+        PassthroughBehavior: WHEN_NO_MATCH
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: true
+            method.response.header.Access-Control-Allow-Methods: true
+            method.response.header.Access-Control-Allow-Origin: true
+          ResponseModels:
+            application/json: Empty
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - CompletionMethod
+      - CompletionOptionsMethod
+    Properties:
+      RestApiId: !Ref SpireApi
+      Description: Initial deployment for SPIRE API
+
+  # API Gateway Stage
+  ApiStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      RestApiId: !Ref SpireApi
+      DeploymentId: !Ref ApiDeployment
+      StageName: prod
+      Description: Production stage for SPIRE API
+      TracingEnabled: true
+      Tags:
+        - Key: Name
+          Value: spire-api-prod
+      MethodSettings:
+        - HttpMethod: '*'
+          ResourcePath: '/*'
+          ThrottlingBurstLimit: 50
+          ThrottlingRateLimit: 100
+
+  ApiUsagePlan:
+    Type: AWS::ApiGateway::UsagePlan
+    DependsOn: ApiStage
+    Properties:
+      UsagePlanName: !Sub ${AWS::StackName}-usage-plan
+      Description: Usage plan for SPIRE API
+      ApiStages:
+        - ApiId: !Ref SpireApi
+          Stage: !Ref ApiStage
+      Throttle:
+        BurstLimit: 50
+        RateLimit: 100
+
+  ApiWafWebAcl:
+    Type: AWS::WAFv2::WebACL
+    Properties:
+      Name: !Sub ${AWS::StackName}-api-waf
+      Scope: REGIONAL
+      DefaultAction:
+        Allow: {}
+      VisibilityConfig:
+        SampledRequestsEnabled: true
+        CloudWatchMetricsEnabled: true
+        MetricName: !Sub ${AWS::StackName}-api-waf
+      Rules:
+        - Name: AWSManagedRulesCommonRuleSet
+          Priority: 1
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesCommonRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: CommonRuleSet
+        - Name: RateLimitRule
+          Priority: 2
+          Action:
+            Block: {}
+          Statement:
+            RateBasedStatement:
+              Limit: 1000
+              AggregateKeyType: IP
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: RateLimit
+        - Name: AWSManagedRulesKnownBadInputsRuleSet
+          Priority: 3
+          OverrideAction:
+            None: {}
+          Statement:
+            ManagedRuleGroupStatement:
+              VendorName: AWS
+              Name: AWSManagedRulesKnownBadInputsRuleSet
+          VisibilityConfig:
+            SampledRequestsEnabled: true
+            CloudWatchMetricsEnabled: true
+            MetricName: KnownBadInputs
+
+  ApiWafAssociation:
+    Type: AWS::WAFv2::WebACLAssociation
+    DependsOn: ApiStage
+    Properties:
+      ResourceArn: !Sub arn:${AWS::Partition}:apigateway:${AWS::Region}::/restapis/${SpireApi}/stages/prod
+      WebACLArn: !GetAtt ApiWafWebAcl.Arn
+
+  # Lambda Permission for Authorizer
+  AuthorizerInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AuthorizerFunction
+      Action: lambda:InvokeFunction
+      Principal: !Sub apigateway.${AWS::URLSuffix}
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SpireApi}/authorizers/${ApiAuthorizer}
+      SourceAccount: !Ref AWS::AccountId
+
+  # Lambda Permission for Backend
+  BackendInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackendFunction
+      Action: lambda:InvokeFunction
+      Principal: !Sub apigateway.${AWS::URLSuffix}
+      SourceArn: !Sub arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${SpireApi}/*/*
+      SourceAccount: !Ref AWS::AccountId
+
+  # ============================================================
+  # Cognito User Pool + App Client for CloudFront authentication
+  # ============================================================
+  CognitoUserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-user-pool
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 16
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Required: true
+          Mutable: true
+
+  CognitoUserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub ${AWS::StackName}-${AWS::AccountId}
+      UserPoolId: !Ref CognitoUserPool
+      ManagedLoginVersion: 2
+
+  CognitoUserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    DependsOn: CognitoUserPoolDomain
+    Properties:
+      ClientName: !Sub ${AWS::StackName}-app-client
+      UserPoolId: !Ref CognitoUserPool
+      GenerateSecret: false
+      AllowedOAuthFlows:
+        - code
+      AllowedOAuthScopes:
+        - openid
+        - email
+        - profile
+      AllowedOAuthFlowsUserPoolClient: true
+      SupportedIdentityProviders:
+        - COGNITO
+      CallbackURLs:
+        - https://placeholder.example.com/auth/callback
+      LogoutURLs:
+        - https://placeholder.example.com/auth/logout
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_REFRESH_TOKEN_AUTH
+
+  ManagedLoginBranding:
+    Type: AWS::Cognito::ManagedLoginBranding
+    Properties:
+      UserPoolId: !Ref CognitoUserPool
+      ClientId: !Ref CognitoUserPoolClient
+      UseCognitoProvidedValues: true
+
+  # ============================================================
+  # CloudFront distribution fronting the ALB (sample app)
+  # ============================================================
+  AppCloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${AWS::StackName} - Sample App with Cognito Auth
+        Enabled: true
+        HttpVersion: http2and3
+        Origins:
+          - Id: ALBOrigin
+            DomainName: placeholder-alb.eu-west-2.elb.amazonaws.com
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, POST, PATCH, DELETE]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.3_2025
+
+  # ============================================================
+  # Auto-create Cognito demo user + store password in Secrets Manager
+  # ============================================================
+  DemoUserPasswordSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${AWS::StackName}-demo-user-password
+      Description: Auto-generated password for the Cognito demo user
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\'''
+        IncludeSpace: false
+        RequireEachIncludedType: true
+
+  CreateDemoUserRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: CognitoAndSecrets
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - cognito-idp:AdminCreateUser
+                  - cognito-idp:AdminSetUserPassword
+                Resource: !GetAtt CognitoUserPool.Arn
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref DemoUserPasswordSecret
+
+  CreateDemoUserFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-create-demo-user
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt CreateDemoUserRole.Arn
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import cfnresponse
+
+          def handler(event, context):
+              if event['RequestType'] == 'Delete':
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                  return
+
+              try:
+                  props = event['ResourceProperties']
+                  user_pool_id = props['UserPoolId']
+                  email = props['Email']
+                  secret_arn = props['SecretArn']
+
+                  sm = boto3.client('secretsmanager')
+                  secret = sm.get_secret_value(SecretId=secret_arn)
+                  password = secret['SecretString']
+
+                  cognito = boto3.client('cognito-idp')
+
+                  try:
+                      cognito.admin_create_user(
+                          UserPoolId=user_pool_id,
+                          Username=email,
+                          UserAttributes=[
+                              {'Name': 'email', 'Value': email},
+                              {'Name': 'email_verified', 'Value': 'true'}
+                          ],
+                          MessageAction='SUPPRESS'
+                      )
+                  except cognito.exceptions.UsernameExistsException:
+                      print(f"User {email} already exists, updating password")
+
+                  cognito.admin_set_user_password(
+                      UserPoolId=user_pool_id,
+                      Username=email,
+                      Password=password,
+                      Permanent=True
+                  )
+
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {
+                      'Email': email,
+                      'SecretArn': secret_arn
+                  })
+              except Exception as e:
+                  print(f"Error: {e}")
+                  cfnresponse.send(event, context, cfnresponse.FAILED, {'Error': str(e)})
+
+  CreateDemoUser:
+    Type: Custom::CreateDemoUser
+    DependsOn:
+      - CognitoUserPool
+      - DemoUserPasswordSecret
+    Properties:
+      ServiceToken: !GetAtt CreateDemoUserFunction.Arn
+      UserPoolId: !Ref CognitoUserPool
+      Email: !Ref DemoUserEmail
+      SecretArn: !Ref DemoUserPasswordSecret
+
+Outputs:
+  ARN:
+    Value: !GetAtt 'ControlPlane.Arn'
+    Export:
+      Name: !Sub '${AWS::StackName}::ARN'
+  AutoModeNodeRoleARN:
+    Value: !GetAtt 'AutoModeNodeRole.Arn'
+    Description: The role that EKS will use by default for launching instances
+    Export:
+      Name: !Sub '${AWS::StackName}-NodeRoleArn'
+  CertificateAuthorityData:
+    Value: !GetAtt 'ControlPlane.CertificateAuthorityData'
+  ClusterSecurityGroupId:
+    Value: !GetAtt 'ControlPlane.ClusterSecurityGroupId'
+    Export:
+      Name: !Sub '${AWS::StackName}::ClusterSecurityGroupId'
+  ClusterStackName:
+    Value: !Ref 'AWS::StackName'
+  Endpoint:
+    Value: !GetAtt 'ControlPlane.Endpoint'
+    Export:
+      Name: !Sub '${AWS::StackName}::Endpoint'
+  FeatureNATMode:
+    Value: Single
+  SecurityGroup:
+    Value: !Ref 'ControlPlaneSecurityGroup'
+    Export:
+      Name: !Sub '${AWS::StackName}::SecurityGroup'
+  ServiceRoleARN:
+    Value: !GetAtt 'ServiceRole.Arn'
+    Export:
+      Name: !Sub '${AWS::StackName}::ServiceRoleARN'
+  SharedNodeSecurityGroup:
+    Value: !Ref 'ClusterSharedNodeSecurityGroup'
+    Export:
+      Name: !Sub '${AWS::StackName}::SharedNodeSecurityGroup'
+  SubnetsPrivate:
+    Value: !Join
+      - ','
+      - - !Ref 'SubnetPrivateAZ2'
+        - !Ref 'SubnetPrivateAZ1'
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPrivate'
+  SubnetsPublic:
+    Value: !Join
+      - ','
+      - - !Ref 'SubnetPublicAZ1'
+        - !Ref 'SubnetPublicAZ2'
+    Export:
+      Name: !Sub '${AWS::StackName}::SubnetsPublic'
+  VPC:
+    Value: !Ref 'VPC'
+    Export:
+      Name: !Sub '${AWS::StackName}::VPC'
+  BucketName:
+    Description: Name of the S3 bucket
+    Value: !Ref ContentBucket
+  DistributionId:
+    Description: ID of the CloudFront distribution
+    Value: !Ref CloudFrontDistribution
+  DistributionDomainName:
+    Description: Domain name of the CloudFront distribution
+    Value: !GetAtt CloudFrontDistribution.DomainName
+  PolicyStoreId:
+    Description: Amazon Verified Permissions Policy Store ID
+    Value: !GetAtt FGACPolicyStore.PolicyStoreId
+    Export:
+      Name: !Sub ${AWS::StackName}-PolicyStoreId
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub https://${SpireApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/prod/fgac
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiEndpoint
+  ApiId:
+    Description: API Gateway ID
+    Value: !Ref SpireApi
+    Export:
+      Name: !Sub ${AWS::StackName}-ApiId
+  AuthorizerFunctionArn:
+    Description: Lambda Authorizer Function ARN
+    Value: !GetAtt AuthorizerFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-AuthorizerArn
+  BackendFunctionArn:
+    Description: Backend Lambda Function ARN
+    Value: !GetAtt BackendFunction.Arn
+    Export:
+      Name: !Sub ${AWS::StackName}-BackendArn
+  PolicyId:
+    Description: Default SPIRE Policy ID
+    Value: !Ref DefaultSpirePolicy
+    Export:
+      Name: !Sub ${AWS::StackName}-PolicyId
+  AppCloudFrontDomain:
+    Description: CloudFront domain for the sample app (with Cognito auth)
+    Value: !GetAtt AppCloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${AWS::StackName}-AppCloudFrontDomain
+  AppCloudFrontDistributionId:
+    Description: CloudFront distribution ID for the sample app
+    Value: !Ref AppCloudFrontDistribution
+    Export:
+      Name: !Sub ${AWS::StackName}-AppCloudFrontDistributionId
+  CognitoUserPoolId:
+    Description: Cognito User Pool ID
+    Value: !Ref CognitoUserPool
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoUserPoolId
+  CognitoUserPoolClientId:
+    Description: Cognito User Pool Client ID
+    Value: !Ref CognitoUserPoolClient
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoClientId
+  CognitoDomain:
+    Description: Cognito hosted UI domain
+    Value: !Sub ${CognitoUserPoolDomain}.auth.${AWS::Region}.amazoncognito.com
+    Export:
+      Name: !Sub ${AWS::StackName}-CognitoDomain
+  DemoUserPasswordSecretArn:
+    Description: Secrets Manager ARN containing the demo user password
+    Value: !Ref DemoUserPasswordSecret
+    Export:
+      Name: !Sub ${AWS::StackName}-DemoUserPasswordArn

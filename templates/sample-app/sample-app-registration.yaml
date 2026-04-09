@@ -1,0 +1,10 @@
+apiVersion: spire.spiffe.io/v1alpha1
+kind: ClusterSPIFFEID
+metadata:
+  name: default-workloads
+spec:
+  spiffeIDTemplate: "spiffe://example.org/ns/{{.PodMeta.Namespace}}/sa/{{.PodSpec.ServiceAccountName}}"
+  podSelector: {}
+  workloadSelectorTemplates:
+  - "k8s:ns:{{.PodMeta.Namespace}}"
+  - "k8s:sa:{{.PodSpec.ServiceAccountName}}"

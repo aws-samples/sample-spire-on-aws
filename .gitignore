@@ -1,0 +1,12 @@
+.DS_Store
+.venv/
+.vscode/
+.kiro/
+__pycache__/
+*.pyc
+.hypothesis/
+.pytest_cache/
+presentation.html
+.threatmodel/
+scan-report.json
+security-docs/

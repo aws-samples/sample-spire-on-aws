@@ -1,0 +1,284 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sample-app
+  namespace: sample-app
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sample-app
+  template:
+    metadata:
+      labels:
+        app: sample-app
+    spec:
+      serviceAccountName: sample-app
+      containers:
+      - name: sample-app
+        image: python:3.11-slim
+        securityContext:
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: false
+        ports:
+        - containerPort: 8080
+        env:
+        - name: COGNITO_DOMAIN
+          value: "<COGNITO_DOMAIN>"
+        - name: COGNITO_CLIENT_ID
+          value: "<COGNITO_CLIENT_ID>"
+        - name: CLOUDFRONT_DOMAIN
+          value: "<CLOUDFRONT_DOMAIN>"
+        - name: AWS_DEFAULT_REGION
+          value: "<AWS_REGION>"
+        command: ["/bin/sh", "-c"]
+        args:
+        - |
+          pip install flask==2.0.1 werkzeug==2.0.1 spiffe urllib3 requests cryptography PyJWT
+
+          cat > /app.py << 'PYEOF'
+          import os, secrets, hashlib, base64, logging
+          from functools import wraps
+          from flask import Flask, request, jsonify, redirect, session
+          from spiffe import WorkloadApiClient, X509Source
+          from cryptography.hazmat.primitives import serialization
+          from cryptography.x509.oid import ExtensionOID
+          import requests as http_requests
+          import jwt
+
+          app = Flask(__name__)
+          app.secret_key = secrets.token_hex(32)
+          logging.basicConfig(level=logging.INFO)
+
+          COGNITO_DOMAIN = os.environ.get('COGNITO_DOMAIN', '')
+          COGNITO_CLIENT_ID = os.environ.get('COGNITO_CLIENT_ID', '')
+          CLOUDFRONT_DOMAIN = os.environ.get('CLOUDFRONT_DOMAIN', '')
+          AWS_REGION = os.environ.get('AWS_DEFAULT_REGION', 'us-east-1')
+          COGNITO_BASE_URL = f"https://{COGNITO_DOMAIN}"
+          CALLBACK_PATH = "/auth/callback"
+
+          workload_api = None
+
+          def login_required(f):
+              @wraps(f)
+              def decorated(*args, **kwargs):
+                  if 'user' not in session:
+                      session['next'] = request.path
+                      return redirect('/auth/login')
+                  return f(*args, **kwargs)
+              return decorated
+
+          def format_x509_details(cert):
+              try:
+                  subject = cert.subject.rfc4514_string()
+                  issuer = cert.issuer.rfc4514_string()
+                  serial = str(cert.serial_number)
+                  not_before = cert.not_valid_before.strftime("%Y-%m-%d %H:%M:%S UTC")
+                  not_after = cert.not_valid_after.strftime("%Y-%m-%d %H:%M:%S UTC")
+                  spiffe_id = None
+                  san_uris = []
+                  try:
+                      san_ext = cert.extensions.get_extension_for_oid(ExtensionOID.SUBJECT_ALTERNATIVE_NAME)
+                      for name in san_ext.value:
+                          if hasattr(name, 'value'):
+                              san_uris.append(name.value)
+                              if name.value.startswith('spiffe://'):
+                                  spiffe_id = name.value
+                  except:
+                      pass
+                  return {
+                      'subject': subject, 'issuer': issuer, 'serial_number': serial,
+                      'not_before': not_before, 'not_after': not_after, 'spiffe_id': spiffe_id,
+                      'san_uris': san_uris, 'signature_algorithm': cert.signature_algorithm_oid._name,
+                      'version': cert.version.name
+                  }
+              except Exception as e:
+                  return {'error': str(e)}
+
+          @app.route('/health')
+          def health():
+              return 'ok', 200
+
+          @app.route('/auth/login')
+          def login():
+              state = secrets.token_urlsafe(32)
+              verifier = secrets.token_urlsafe(64)
+              challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b'=').decode()
+              session['oauth_state'] = state
+              session['code_verifier'] = verifier
+              callback = f"https://{CLOUDFRONT_DOMAIN}{CALLBACK_PATH}"
+              return redirect(
+                  f"{COGNITO_BASE_URL}/oauth2/authorize?response_type=code&client_id={COGNITO_CLIENT_ID}"
+                  f"&redirect_uri={callback}&scope=openid+email+profile&state={state}"
+                  f"&code_challenge={challenge}&code_challenge_method=S256"
+              )
+
+          @app.route('/auth/callback')
+          def auth_callback():
+              code = request.args.get('code')
+              state = request.args.get('state')
+              if not code or state != session.get('oauth_state'):
+                  return 'Invalid state or missing code', 400
+              callback = f"https://{CLOUDFRONT_DOMAIN}{CALLBACK_PATH}"
+              resp = http_requests.post(f"{COGNITO_BASE_URL}/oauth2/token", data={
+                  'grant_type': 'authorization_code',
+                  'client_id': COGNITO_CLIENT_ID,
+                  'code': code,
+                  'redirect_uri': callback,
+                  'code_verifier': session.get('code_verifier', '')
+              }, headers={'Content-Type': 'application/x-www-form-urlencoded'})
+              if resp.status_code != 200:
+                  return f'Token exchange failed: {resp.text}', 400
+              tokens = resp.json()
+              claims = jwt.decode(tokens.get('id_token', ''), options={"verify_signature": False})
+              session['user'] = claims.get('email', claims.get('sub', 'unknown'))
+              session.pop('oauth_state', None)
+              session.pop('code_verifier', None)
+              return redirect(session.pop('next', '/'))
+
+          @app.route('/auth/logout')
+          def logout():
+              session.clear()
+              return redirect('/auth/login')
+
+          @app.route('/')
+          @login_required
+          def get_identity():
+              try:
+                  global workload_api
+                  if not workload_api:
+                      workload_api = WorkloadApiClient("unix:///spiffe-workload-api/agent.sock")
+                  svid = workload_api.fetch_x509_svid()
+                  spiffe_id = svid.spiffe_id
+                  leaf_cert = svid.cert_chain[0] if svid.cert_chain else None
+                  cert_details = format_x509_details(leaf_cert) if leaf_cert else {}
+                  cert_pem = leaf_cert.public_bytes(serialization.Encoding.PEM).decode('utf-8') if leaf_cert else "No certificate"
+                  jwt_svid = workload_api.fetch_jwt_svid(audience={"test"})
+                  source = X509Source(workload_api)
+                  trust_domains = [str(b.trust_domain) for b in source.bundles]
+                  user = session.get('user', 'unknown')
+                  return f'''
+                  <!DOCTYPE html>
+                  <html>
+                  <head>
+                      <title>SPIRE on AWS Sample App</title>
+                      <style>
+                          body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }}
+                          .container {{ background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                          h1 {{ color: #232f3e; border-bottom: 3px solid #ff9900; padding-bottom: 10px; }}
+                          h2 {{ color: #232f3e; border-bottom: 2px solid #ff9900; padding-bottom: 5px; margin-top: 30px; }}
+                          .info-section {{ margin: 20px 0; padding: 15px; background-color: #f8f9fa; border-left: 4px solid #ff9900; }}
+                          .label {{ font-weight: bold; color: #232f3e; }}
+                          .value {{ font-family: monospace; background-color: #e9ecef; padding: 5px; border-radius: 3px; word-break: break-all; overflow-wrap: break-word; }}
+                          .cert-pem {{ font-family: monospace; background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 4px; white-space: pre-wrap; font-size: 12px; max-height: 200px; overflow-y: auto; }}
+                          .grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 15px; }}
+                          .user-bar {{ background-color: #232f3e; color: white; padding: 10px 20px; border-radius: 4px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }}
+                          .user-bar a {{ color: #ff9900; text-decoration: none; }}
+                          @media (max-width: 768px) {{ .grid {{ grid-template-columns: 1fr; }} }}
+                      </style>
+                  </head>
+                  <body>
+                      <div class="container">
+                          <div class="user-bar"><span>Signed in as: {user}</span><a href="/auth/logout">Sign out</a></div>
+                          <h1>SPIRE on AWS Sample App</h1>
+                          <div class="info-section">
+                              <h2>Identity Information</h2>
+                              <p><span class="label">SPIFFE ID:</span> <span class="value">{spiffe_id}</span></p>
+                              <p><span class="label">Trust Domains:</span> <span class="value">{', '.join(trust_domains)}</span></p>
+                          </div>
+                          <div class="info-section">
+                              <h2>X.509 SVID Certificate Details</h2>
+                              <div class="grid">
+                                  <div>
+                                      <p><span class="label">Subject:</span><br><span class="value">{cert_details.get('subject', 'N/A')}</span></p>
+                                      <p><span class="label">Issuer:</span><br><span class="value">{cert_details.get('issuer', 'N/A')}</span></p>
+                                      <p><span class="label">Serial Number:</span><br><span class="value">{cert_details.get('serial_number', 'N/A')}</span></p>
+                                  </div>
+                                  <div>
+                                      <p><span class="label">Valid From:</span><br><span class="value">{cert_details.get('not_before', 'N/A')}</span></p>
+                                      <p><span class="label">Valid Until:</span><br><span class="value">{cert_details.get('not_after', 'N/A')}</span></p>
+                                      <p><span class="label">Signature Algorithm:</span><br><span class="value">{cert_details.get('signature_algorithm', 'N/A')}</span></p>
+                                  </div>
+                              </div>
+                              <p><span class="label">SAN URIs:</span><br><span class="value">{', '.join(cert_details.get('san_uris', [])) if cert_details.get('san_uris') else 'N/A'}</span></p>
+                          </div>
+                          <div class="info-section">
+                              <h2>X.509 Certificate (PEM)</h2>
+                              <div class="cert-pem">{cert_pem}</div>
+                          </div>
+                          <div class="info-section">
+                              <h2>JWT SVID</h2>
+                              <div class="cert-pem">{jwt_svid.token}</div>
+                          </div>
+                      </div>
+                  </body>
+                  </html>'''
+              except Exception as e:
+                  logging.error(f"Error: {e}")
+                  return f'<h1>Error</h1><p>{str(e)}</p>', 500
+
+          @app.route('/fgac')
+          @login_required
+          def fgac():
+              try:
+                  global workload_api
+                  if not workload_api:
+                      workload_api = WorkloadApiClient("unix:///spiffe-workload-api/agent.sock")
+                  jwt_svid = workload_api.fetch_jwt_svid(audience={"api-gateway"})
+                  api_endpoint = "<>"
+                  resp = http_requests.get(api_endpoint, headers={"Authorization": f"Bearer {jwt_svid.token}"})
+                  user = session.get('user', 'unknown')
+                  return f'''
+                  <!DOCTYPE html>
+                  <html>
+                  <head>
+                      <title>SPIRE on AWS - Fine-Grained Access Control</title>
+                      <style>
+                          body {{ font-family: Arial, sans-serif; margin: 40px; background-color: #f5f5f5; }}
+                          .container {{ background-color: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                          h1 {{ color: #232f3e; border-bottom: 3px solid #ff9900; padding-bottom: 10px; }}
+                          h2 {{ color: #232f3e; border-bottom: 2px solid #ff9900; padding-bottom: 5px; margin-top: 30px; }}
+                          .info-section {{ margin: 20px 0; padding: 15px; background-color: #f8f9fa; border-left: 4px solid #ff9900; }}
+                          .label {{ font-weight: bold; color: #232f3e; }}
+                          .value {{ font-family: monospace; background-color: #e9ecef; padding: 5px; border-radius: 3px; word-break: break-all; }}
+                          .jwt-token {{ font-family: monospace; background-color: #f8f9fa; padding: 10px; border: 1px solid #dee2e6; border-radius: 4px; white-space: pre-wrap; font-size: 12px; max-height: 150px; overflow-y: auto; }}
+                          .response {{ background-color: #e7f3ff; border: 1px solid #b3d9ff; padding: 15px; border-radius: 4px; margin: 20px 0; }}
+                          .user-bar {{ background-color: #232f3e; color: white; padding: 10px 20px; border-radius: 4px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center; }}
+                          .user-bar a {{ color: #ff9900; text-decoration: none; }}
+                      </style>
+                  </head>
+                  <body>
+                      <div class="container">
+                          <div class="user-bar"><span>Signed in as: {user}</span><a href="/auth/logout">Sign out</a></div>
+                          <h1>Fine-Grained Access Control Demo</h1>
+                          <div class="info-section">
+                              <h2>JWT SVID Token</h2>
+                              <p><span class="label">Audience:</span> <span class="value">api-gateway</span></p>
+                              <div class="jwt-token">{jwt_svid.token}</div>
+                          </div>
+                          <div class="info-section">
+                              <h2>API Gateway Response</h2>
+                              <p><span class="label">Status Code:</span> <span class="value">{resp.status_code}</span></p>
+                              <div class="response"><strong>Response:</strong><br>{resp.text}</div>
+                          </div>
+                      </div>
+                  </body>
+                  </html>'''
+              except Exception as e:
+                  logging.error(f"FGAC error: {e}")
+                  return f'<h1>Error</h1><p>{str(e)}</p>', 500
+
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=8080)
+          PYEOF
+
+          python /app.py
+        volumeMounts:
+        - name: spiffe-workload-api
+          mountPath: /spiffe-workload-api
+          readOnly: true
+      volumes:
+      - name: spiffe-workload-api
+        csi:
+          driver: "csi.spiffe.io"
+          readOnly: true

@@ -1,0 +1,380 @@
+# ServiceAccount used by the SPIRE server.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire-system
+
+---
+
+# Required cluster role to allow spire-server to query k8s API server
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-cluster-role
+rules:
+- apiGroups: [""]
+  resources: ["nodes"]
+  verbs: ["get"]
+  # allow TokenReview requests (to verify service account tokens for PSAT
+  # attestation)
+- apiGroups: ["authentication.k8s.io"]
+  resources: ["tokenreviews"]
+  verbs: ["get", "create"]
+
+---
+
+# Binds above cluster role to spire-server service account
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-cluster-role-binding
+  namespace: spire-system
+subjects:
+- kind: ServiceAccount
+  name: spire-server
+  namespace: spire-system
+roleRef:
+  kind: ClusterRole
+  name: spire-server-cluster-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# Role for the SPIRE server
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  namespace: spire-system
+  name: spire-server-role
+rules:
+  # allow "get" access to pods (to resolve selectors for PSAT attestation)
+- apiGroups: [""]
+  resources: ["pods"]
+  verbs: ["get"]
+  # allow access to "get" and "patch" the spire-bundle ConfigMap (for SPIRE
+  # agent bootstrapping, see the spire-bundle ConfigMap below)
+- apiGroups: [""]
+  resources: ["configmaps"]
+  resourceNames: ["spire-bundle"]
+  verbs: ["get", "patch"]
+
+---
+
+# RoleBinding granting the spire-server-role to the SPIRE server
+# service account.
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-role-binding
+  namespace: spire-system
+subjects:
+- kind: ServiceAccount
+  name: spire-server
+  namespace: spire-system
+roleRef:
+  kind: Role
+  name: spire-server-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+
+# ConfigMap containing the latest trust bundle for the trust domain. It is
+# updated by SPIRE using the k8sbundle notifier plugin. SPIRE agents mount
+# this config map and use the certificate to bootstrap trust with the SPIRE
+# server during attestation.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-bundle
+  namespace: spire-system
+
+---
+
+# ConfigMap containing the SPIRE server configuration.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: spire-system
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = "8081"
+      trust_domain = "example.org"
+      #jwt_issuer= "https://<>.cloudfront.net"
+      data_dir = "/run/spire/server/data"
+      log_level = "DEBUG"
+      federation {
+        bundle_endpoint {
+          address = "0.0.0.0"
+          port = 8443
+        }
+      }
+    }
+
+    plugins {
+
+    ####### REMOVE THIS BLOCK in the RDS STEP ############
+
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/server/data/datastore.sqlite3"
+        }
+      }
+    ####################################################
+    #### UNCOMMENT THIS BLOCK, REPLACE WITH YOUR DB ENDPOINT #########
+    #   DataStore "sql" {
+    #    plugin_data {
+    #        database_type "aws_postgres" {
+    #            region = "us-east-2"
+    #       }
+    #        connection_string = "dbname=postgres user=spiffe host=<your_db_endpoint> port=5432"
+    #    }
+    # }
+    ###################################################################
+
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "aws-spire-cluster" = {
+              service_account_allow_list = ["spire-system:spire-agent"]
+            }
+          }
+        }
+      }
+      
+      ############# REMOVE THIS BLOCK IN THE KMS MODULE ##############
+
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/run/spire/server/data/keys.json"
+        }
+      }
+      #############################################
+
+      Notifier "k8sbundle" {
+        plugin_data {
+          namespace = "spire-system"
+        }
+      }
+    ########## UNCOMMENT THIS BLOCK IN THE KMS STEP #############
+      # KeyManager "aws_kms" {
+      #   plugin_data {        
+      #     region = "us-east-2"
+      #     key_identifier_file = "./key_metadata"
+      #     key_policy_file = "/run/spire/server/kms/custom-key-policy.json"
+      #   }
+      # }
+    ############################################
+    ###### UNCOMMENT THIS BLOCK, ENTER YOUR PCA CA ARN #######
+    # UpstreamAuthority "aws_pca" {
+    #   plugin_data {
+    #       region = "us-east-2"
+    #       certificate_authority_arn = "<your_pca_arn>"
+    #       ca_signing_template_arn = "arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1"
+    #   }
+    # }
+    ########################################################
+    ###### UNCOMMENT THIS BLOCK, REPLACE WITH YOUR BUCKET NAME #######
+    # BundlePublisher "aws_s3" {
+    #   plugin_data {
+    #       region = "us-east-2"
+    #       bucket = "trust-bundle-bucket-<your_account_id>"
+    #       object_key = "example.org"
+    #       format = "spiffe"
+    #   }
+    # }
+  
+    #################################################################
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+
+---
+
+# ConfigMap containing the custom KMS key policy.
+# Gives the SPIRE server role operational access and the account root full
+# access so keys are never orphaned if the role is deleted.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-kms-key-policy
+  namespace: spire-system
+data:
+  custom-key-policy.json: |
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Sid": "AllowRootFullAccess",
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:root"
+          },
+          "Action": "kms:*",
+          "Resource": "*"
+        },
+        {
+          "Sid": "AllowSpireServerRoleAccess",
+          "Effect": "Allow",
+          "Principal": {
+            "AWS": "arn:aws:iam::ACCOUNT_ID_PLACEHOLDER:role/spire-server-role-spiffe"
+          },
+          "Action": [
+            "kms:CreateAlias",
+            "kms:CreateKey",
+            "kms:DescribeKey",
+            "kms:GetPublicKey",
+            "kms:GetKeyPolicy",
+            "kms:PutKeyPolicy",
+            "kms:ListKeys",
+            "kms:ListAliases",
+            "kms:ScheduleKeyDeletion",
+            "kms:Sign",
+            "kms:UpdateAlias",
+            "kms:DeleteAlias"
+          ],
+          "Resource": "*"
+        }
+      ]
+    }
+
+---
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spire-server
+  namespace: spire-system
+  labels:
+    app: spire-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  template:
+    metadata:
+      namespace: spire-system
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+      shareProcessNamespace: true
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.14.0
+          imagePullPolicy: IfNotPresent
+          args: ["-config", "/run/spire/server/config/server.conf"]
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          ports:
+            - containerPort: 8081
+          volumeMounts:
+            - name: spire-config
+              mountPath: /run/spire/server/config
+              readOnly: true
+            - name: spire-kms-key-policy
+              mountPath: /run/spire/server/kms/custom-key-policy.json
+              subPath: custom-key-policy.json
+              readOnly: true
+            - name: spire-server-socket
+              mountPath: /tmp/spire-server/private
+        - name: spire-controller-manager
+          image: ghcr.io/spiffe/spire-controller-manager:nightly
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+          ports:
+            - containerPort: 9443
+            - containerPort: 8083
+              name: healthz
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: healthz
+          args:
+          - "--config=spire-controller-manager-config.yaml"
+          volumeMounts:
+            - name: spire-server-socket
+              mountPath: /spire-server
+              readOnly: true
+            - name: spire-controller-manager-config
+              mountPath: /spire-controller-manager-config.yaml
+              subPath: spire-controller-manager-config.yaml
+      volumes:
+        - name: spire-config
+          configMap:
+            name: spire-server
+        - name: spire-kms-key-policy
+          configMap:
+            name: spire-kms-key-policy
+        - name: spire-server-socket
+          emptyDir: {}
+        - name: spire-controller-manager-config
+          configMap:
+            name: spire-controller-manager-config
+
+---
+
+# Service definition for SPIRE server defining the gRPC port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire-system
+spec:
+  type: NodePort
+  ports:
+    - name: api
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+  selector:
+    app: spire-server
+
+---
+
+# Service definition for SPIRE server bundle endpoint
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server-bundle-endpoint
+  namespace: spire-system
+spec:
+  type: NodePort
+  ports:
+    - name: api
+      port: 8443
+      protocol: TCP
+  selector:
+    app: spire-server
+
+
+---
+#
+# Service definition for SPIRE controller manager webhook
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-controller-manager-webhook-service
+  namespace: spire-system
+spec:
+  ports:
+    - port: 443
+      protocol: TCP
+      targetPort: 9443
+  selector:
+    app: spire-server
+

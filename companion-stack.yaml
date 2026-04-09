@@ -1,0 +1,698 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  SPIRE Blog Companion Stack - Deploys a CodeBuild project that automates
+  the complete SPIFFE/SPIRE setup on an existing EKS cluster.
+
+Parameters:
+  BaseStackName:
+    Type: String
+    Default: spiffe
+    Description: Name of the base infrastructure stack (spiffe.yaml)
+  SpireVersion:
+    Type: String
+    Default: "1.14.0"
+    Description: SPIRE container image version tag (must be >= 1.14.0)
+  DeployPCA:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to activate PCA certificate hierarchy
+  DeployKMS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to configure SPIRE with AWS KMS KeyManager
+  DeployRDS:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to configure SPIRE with Aurora PostgreSQL DataStore
+  DeployVerifiedPermissions:
+    Type: String
+    Default: 'true'
+    AllowedValues: ['true', 'false']
+    Description: Whether to deploy the authorization module (Sample App 2, API Gateway integration)
+  TemplateBucketName:
+    Type: String
+    Description: S3 bucket containing the K8s manifest templates (created by upload-templates.sh)
+
+Resources:
+
+  CodeBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${AWS::StackName}-codebuild-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: CompanionBuildPolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: ACMPCAAccess
+                Effect: Allow
+                Action:
+                  - acm-pca:GetCertificateAuthorityCsr
+                  - acm-pca:IssueCertificate
+                  - acm-pca:GetCertificate
+                  - acm-pca:ImportCertificateAuthorityCertificate
+                  - acm-pca:DescribeCertificateAuthority
+                  - acm-pca:ListCertificateAuthorities
+                Resource: "*"
+              - Sid: RDSDataAPIAccess
+                Effect: Allow
+                Action:
+                  - rds-data:ExecuteStatement
+                Resource: "*"
+              - Sid: SecretsManagerAccess
+                Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:ListSecrets
+                Resource: "*"
+              - Sid: RDSDescribe
+                Effect: Allow
+                Action:
+                  - rds:DescribeDBClusters
+                Resource: "*"
+              - Sid: S3Access
+                Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub "arn:aws:s3:::${TemplateBucketName}"
+                  - !Sub "arn:aws:s3:::${TemplateBucketName}/*"
+                  - !Sub "arn:aws:s3:::trust-bundle-bucket-${AWS::AccountId}-${AWS::Region}"
+                  - !Sub "arn:aws:s3:::trust-bundle-bucket-${AWS::AccountId}-${AWS::Region}/*"
+              - Sid: CloudFrontAccess
+                Effect: Allow
+                Action:
+                  - cloudfront:ListDistributions
+                  - cloudfront:CreateInvalidation
+                  - cloudfront:GetDistributionConfig
+                  - cloudfront:UpdateDistribution
+                Resource: "*"
+              - Sid: CloudFormationAccess
+                Effect: Allow
+                Action:
+                  - cloudformation:DescribeStacks
+                Resource: !Sub "arn:aws:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${BaseStackName}/*"
+              - Sid: EKSAccess
+                Effect: Allow
+                Action:
+                  - eks:DescribeCluster
+                  - eks:AccessKubernetesApi
+                  - eks:CreatePodIdentityAssociation
+                  - eks:DescribePodIdentityAssociation
+                  - eks:ListPodIdentityAssociations
+                Resource: !Sub "arn:aws:eks:${AWS::Region}:${AWS::AccountId}:cluster/aws-spire-cluster"
+              - Sid: IAMAccess
+                Effect: Allow
+                Action:
+                  - iam:CreatePolicy
+                  - iam:CreatePolicyVersion
+                  - iam:CreateRole
+                  - iam:AttachRolePolicy
+                  - iam:GetPolicy
+                  - iam:GetRole
+                  - iam:PassRole
+                Resource:
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-lbc-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/aws-lbc-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/spire-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/spire-*"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:role/AmazonEKSLoadBalancerControllerRole"
+                  - !Sub "arn:aws:iam::${AWS::AccountId}:policy/AWSLoadBalancerControllerIAMPolicy"
+              - Sid: STSAccess
+                Effect: Allow
+                Action:
+                  - sts:GetCallerIdentity
+                Resource: "*"
+              - Sid: VerifiedPermissionsAccess
+                Effect: Allow
+                Action:
+                  - verifiedpermissions:CreateIdentitySource
+                  - verifiedpermissions:ListIdentitySources
+                Resource: "*"
+              - Sid: LambdaAccess
+                Effect: Allow
+                Action:
+                  - lambda:GetFunctionConfiguration
+                  - lambda:UpdateFunctionConfiguration
+                  - lambda:UpdateFunctionCode
+                  - lambda:PublishVersion
+                  - lambda:GetFunction
+                  - lambda:EnableReplication*
+                Resource:
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BaseStackName}-*"
+                  - !Sub "arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${BaseStackName}-*"
+                  - !Sub "arn:aws:lambda:us-east-1:${AWS::AccountId}:function:${BaseStackName}-*"
+              - Sid: CognitoAccess
+                Effect: Allow
+                Action:
+                  - cognito-idp:DescribeUserPoolClient
+                  - cognito-idp:UpdateUserPoolClient
+                Resource: !Sub "arn:aws:cognito-idp:${AWS::Region}:${AWS::AccountId}:userpool/*"
+              - Sid: CloudWatchLogs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/*"
+
+  CodeBuildAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: aws-spire-cluster
+      PrincipalArn: !GetAtt CodeBuildRole.Arn
+      AccessPolicies:
+        - PolicyArn: arn:aws:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+
+  CodeBuildEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: KMS key for CodeBuild build artifact encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: EnableRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+            Action: 'kms:*'
+            Resource: '*'
+          - Sid: AllowCodeBuildRole
+            Effect: Allow
+            Principal:
+              AWS: !GetAtt CodeBuildRole.Arn
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+
+  CodeBuildLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/codebuild/${AWS::StackName}-setup
+      RetentionInDays: 90
+
+  SetupProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: CodeBuildAccessEntry
+    Properties:
+      Name: !Sub "${AWS::StackName}-setup"
+      Description: Automates SPIFFE/SPIRE setup on EKS
+      ServiceRole: !GetAtt CodeBuildRole.Arn
+      EncryptionKey: !GetAtt CodeBuildEncryptionKey.Arn
+      TimeoutInMinutes: 30
+      LogsConfig:
+        CloudWatchLogs:
+          GroupName: !Ref CodeBuildLogGroup
+          Status: ENABLED
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/amazonlinux2-x86_64-standard:5.0
+        EnvironmentVariables:
+          - Name: BASE_STACK_NAME
+            Value: !Ref BaseStackName
+          - Name: SPIRE_VERSION
+            Value: !Ref SpireVersion
+          - Name: DEPLOY_PCA
+            Value: !Ref DeployPCA
+          - Name: DEPLOY_KMS
+            Value: !Ref DeployKMS
+          - Name: DEPLOY_RDS
+            Value: !Ref DeployRDS
+          - Name: DEPLOY_VERIFIED_PERMISSIONS
+            Value: !Ref DeployVerifiedPermissions
+          - Name: TEMPLATE_BUCKET
+            Value: !Ref TemplateBucketName
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          phases:
+            install:
+              commands:
+                - echo "Installing kubectl..."
+                - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+                - curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl.sha256"
+                - echo "$(cat kubectl.sha256)  kubectl" | sha256sum --check
+                - chmod +x kubectl && mv kubectl /usr/local/bin/
+                - rm -f kubectl.sha256
+                - kubectl version --client
+            build:
+              commands:
+                - set -euo pipefail
+                - echo "=== Step 1 - Configure EKS access ==="
+                - aws eks update-kubeconfig --name aws-spire-cluster --region $AWS_DEFAULT_REGION
+                - echo "=== Step 2 - Query base stack outputs and AWS APIs ==="
+                - STACK_OUTPUTS=$(aws cloudformation describe-stacks --stack-name "$BASE_STACK_NAME" --query 'Stacks[0].Outputs' --output json)
+                - |
+                  if [ -z "$STACK_OUTPUTS" ] || [ "$STACK_OUTPUTS" = "null" ]; then
+                    echo "ERROR: Could not retrieve outputs from stack $BASE_STACK_NAME"
+                    exit 1
+                  fi
+                - export S3_BUCKET=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="BucketName") | .OutputValue')
+                - export CLOUDFRONT_DOMAIN=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="DistributionDomainName") | .OutputValue')
+                - export API_ENDPOINT=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="ApiEndpoint") | .OutputValue')
+                - |
+                  if [ "$DEPLOY_RDS" = "true" ]; then
+                    export RDS_ENDPOINT=$(aws rds describe-db-clusters --query "DBClusters[?starts_with(DBClusterIdentifier, '${BASE_STACK_NAME}')].Endpoint" --output text)
+                    AURORA_CLUSTER_ARN=$(aws rds describe-db-clusters --query "DBClusters[?starts_with(DBClusterIdentifier, '${BASE_STACK_NAME}')].DBClusterArn" --output text)
+                    AURORA_SECRET_ARN=$(aws rds describe-db-clusters --query "DBClusters[?starts_with(DBClusterIdentifier, '${BASE_STACK_NAME}')].MasterUserSecret.SecretArn" --output text)
+                    echo "RDS_ENDPOINT=$RDS_ENDPOINT"
+                  fi
+                - |
+                  if [ "$DEPLOY_PCA" = "true" ]; then
+                    ROOT_CA_ARN=$(aws acm-pca list-certificate-authorities \
+                      --query "CertificateAuthorities[?CertificateAuthorityConfiguration.Subject.CommonName=='ROOT SPIRE CA' && (Status=='ACTIVE' || Status=='PENDING_CERTIFICATE')] | [0].Arn" \
+                      --output text)
+                    echo "ROOT_CA_ARN=$ROOT_CA_ARN"
+                  fi
+                - echo "S3_BUCKET=$S3_BUCKET"
+                - echo "CLOUDFRONT_DOMAIN=$CLOUDFRONT_DOMAIN"
+                - echo "API_ENDPOINT=$API_ENDPOINT"
+                - echo "=== Step 3 - Activate PCA hierarchy ==="
+                - |
+                  if [ "$DEPLOY_PCA" = "true" ]; then
+                    ROOT_STATUS=$(aws acm-pca describe-certificate-authority --certificate-authority-arn "$ROOT_CA_ARN" --query 'CertificateAuthority.Status' --output text)
+                    if [ "$ROOT_STATUS" != "ACTIVE" ]; then
+                      echo "Activating Root CA..."
+                      aws acm-pca get-certificate-authority-csr --certificate-authority-arn "$ROOT_CA_ARN" --output text > /tmp/root-ca.csr
+                      ROOT_CERT_ARN=$(aws acm-pca issue-certificate \
+                        --certificate-authority-arn "$ROOT_CA_ARN" \
+                        --csr fileb:///tmp/root-ca.csr \
+                        --signing-algorithm SHA256WITHECDSA \
+                        --template-arn arn:aws:acm-pca:::template/RootCACertificate/V1 \
+                        --validity Value=10,Type=YEARS \
+                        --query 'CertificateArn' --output text)
+                      aws acm-pca wait certificate-issued --certificate-authority-arn "$ROOT_CA_ARN" --certificate-arn "$ROOT_CERT_ARN"
+                      aws acm-pca get-certificate --certificate-authority-arn "$ROOT_CA_ARN" --certificate-arn "$ROOT_CERT_ARN" --query 'Certificate' --output text > /tmp/root-cert.pem
+                      aws acm-pca import-certificate-authority-certificate --certificate-authority-arn "$ROOT_CA_ARN" --certificate fileb:///tmp/root-cert.pem
+                      echo "Root CA activated."
+                    else
+                      echo "Root CA already ACTIVE, skipping."
+                    fi
+                  else
+                    echo "PCA deployment disabled, skipping PCA activation."
+                  fi
+                - echo "=== Step 4 - Create RDS database user ==="
+                - |
+                  if [ "$DEPLOY_RDS" = "true" ]; then
+                    aws rds-data execute-statement \
+                      --resource-arn "$AURORA_CLUSTER_ARN" \
+                      --secret-arn "$AURORA_SECRET_ARN" \
+                      --database postgres \
+                      --sql "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'spiffe') THEN CREATE USER spiffe; GRANT rds_iam TO spiffe; GRANT USAGE ON SCHEMA public TO spiffe; GRANT CREATE ON SCHEMA public TO spiffe; END IF; END \$\$;"
+                    echo "RDS user setup complete."
+                  else
+                    echo "RDS deployment disabled, skipping RDS user setup."
+                  fi
+                - echo "=== Step 5 - Upload OIDC discovery config ==="
+                - |
+                  cat > /tmp/openid-configuration << OIDCEOF
+                  {
+                    "issuer": "https://${CLOUDFRONT_DOMAIN}",
+                    "jwks_uri": "https://${CLOUDFRONT_DOMAIN}/example.org",
+                    "token_endpoint": "https://${CLOUDFRONT_DOMAIN}/token",
+                    "response_types_supported": ["id_token"],
+                    "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["RS256", "ES256", "ES384"],
+                    "claims_supported": ["sub", "aud", "exp", "iat"]
+                  }
+                  OIDCEOF
+                  aws s3 cp /tmp/openid-configuration "s3://${S3_BUCKET}/.well-known/openid-configuration" --content-type application/json
+                  echo "OIDC discovery config uploaded."
+                - echo "=== Step 5b - Invalidate CloudFront cache ==="
+                - |
+                  DISTRIBUTION_ID=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="DistributionId") | .OutputValue')
+                  aws cloudfront create-invalidation --distribution-id "$DISTRIBUTION_ID" --paths "/.well-known/openid-configuration"
+                  echo "CloudFront cache invalidated for OIDC discovery endpoint."
+                - echo "=== Step 6 - Download and customize K8s manifests ==="
+                - mkdir -p /tmp/k8s-templates/templates
+                - aws s3 sync "s3://${TEMPLATE_BUCKET}/templates/" /tmp/k8s-templates/templates/
+                - cd /tmp/k8s-templates/templates
+                - echo "=== Step 6a2 - Substitute account ID in KMS key policy ==="
+                - |
+                  ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+                  sed -i "s/ACCOUNT_ID_PLACEHOLDER/${ACCOUNT_ID}/g" spire/spire-server.yaml
+                  echo "Substituted ACCOUNT_ID_PLACEHOLDER with ${ACCOUNT_ID} in key policy ConfigMap."
+                - echo "=== Step 6b - Customize SPIRE server config in-place ==="
+                - |
+                  # Use Python to rewrite the server ConfigMap data section in spire/spire-server.yaml
+                  python3 << 'PYEOF'
+                  import re, os
+
+                  region = os.environ["AWS_DEFAULT_REGION"]
+                  s3_bucket = os.environ["S3_BUCKET"]
+                  cf_domain = os.environ["CLOUDFRONT_DOMAIN"]
+                  deploy_rds = os.environ.get("DEPLOY_RDS", "false")
+                  deploy_kms = os.environ.get("DEPLOY_KMS", "false")
+                  deploy_pca = os.environ.get("DEPLOY_PCA", "false")
+                  rds_endpoint = os.environ.get("RDS_ENDPOINT", "")
+                  root_ca_arn = os.environ.get("ROOT_CA_ARN", "")
+
+                  # Build the new server.conf content
+                  ds_block = ""
+                  if deploy_rds == "true":
+                      ds_block = f'''    DataStore "sql" {{
+                        plugin_data {{
+                          database_type "aws_postgres" {{
+                            region = "{region}"
+                          }}
+                          connection_string = "dbname=postgres user=spiffe host={rds_endpoint} port=5432"
+                        }}
+                      }}'''
+                  else:
+                      ds_block = '''    DataStore "sql" {
+                        plugin_data {
+                          database_type = "sqlite3"
+                          connection_string = "/run/spire/server/data/datastore.sqlite3"
+                        }
+                      }'''
+
+                  km_block = ""
+                  if deploy_kms == "true":
+                      km_block = f'''    KeyManager "aws_kms" {{
+                        plugin_data {{
+                          region = "{region}"
+                          key_identifier_file = "./key_metadata"
+                          key_policy_file = "/run/spire/server/kms/custom-key-policy.json"
+                        }}
+                      }}'''
+                  else:
+                      km_block = '''    KeyManager "disk" {
+                        plugin_data {
+                          keys_path = "/run/spire/server/data/keys.json"
+                        }
+                      }'''
+
+                  ua_block = ""
+                  if deploy_pca == "true":
+                      ua_block = f'''    UpstreamAuthority "aws_pca" {{
+                        plugin_data {{
+                          region = "{region}"
+                          certificate_authority_arn = "{root_ca_arn}"
+                          ca_signing_template_arn = "arn:aws:acm-pca:::template/SubordinateCACertificate_PathLen0/V1"
+                        }}
+                      }}'''
+
+                  new_conf = f'''    server {{
+                        bind_address = "0.0.0.0"
+                        bind_port = "8081"
+                        trust_domain = "example.org"
+                        jwt_issuer = "https://{cf_domain}"
+                        data_dir = "/run/spire/server/data"
+                        log_level = "DEBUG"
+                        federation {{
+                          bundle_endpoint {{
+                            address = "0.0.0.0"
+                            port = 8443
+                          }}
+                        }}
+                      }}
+
+                      plugins {{
+
+                  {ds_block}
+
+                        NodeAttestor "k8s_psat" {{
+                          plugin_data {{
+                            clusters = {{
+                              "aws-spire-cluster" = {{
+                                service_account_allow_list = ["spire-system:spire-agent"]
+                              }}
+                            }}
+                          }}
+                        }}
+
+                  {km_block}
+
+                        Notifier "k8sbundle" {{
+                          plugin_data {{
+                            namespace = "spire-system"
+                          }}
+                        }}
+
+                  {ua_block}
+
+                        BundlePublisher "aws_s3" {{
+                          plugin_data {{
+                            region = "{region}"
+                            bucket = "{s3_bucket}"
+                            object_key = "example.org"
+                            format = "spiffe"
+                          }}
+                        }}
+                      }}
+
+                      health_checks {{
+                        listener_enabled = true
+                        bind_address = "0.0.0.0"
+                        bind_port = "8080"
+                        live_path = "/live"
+                        ready_path = "/ready"
+                      }}'''
+
+                  with open("spire/spire-server.yaml", "r") as f:
+                      content = f.read()
+
+                  # Replace the ConfigMap data section for spire-server config
+                  # Match from "  server.conf: |" to the next "---" separator
+                  pattern = r'(kind: ConfigMap\nmetadata:\n  name: spire-server\n  namespace: spire-system\ndata:\n  server\.conf: \|)\n.*?(\n---)'
+                  replacement = r'\1\n' + new_conf + r'\2'
+                  content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+                  with open("spire/spire-server.yaml", "w") as f:
+                      f.write(content)
+
+                  print("Server ConfigMap updated in spire/spire-server.yaml")
+                  PYEOF
+                - echo "=== Step 6c - Customize SPIRE agent config in-place ==="
+                - |
+                  python3 << 'PYEOF'
+                  import re, os
+
+                  region = os.environ["AWS_DEFAULT_REGION"]
+
+                  new_agent_conf = f'''    agent {{
+                        data_dir = "/run/spire"
+                        log_level = "DEBUG"
+                        server_address = "spire-server"
+                        server_port = "8081"
+                        socket_path = "/run/spire/sockets/agent.sock"
+                        trust_bundle_path = "/run/spire/bundle/bundle.crt"
+                        trust_domain = "example.org"
+                      }}
+
+                      plugins {{
+                        NodeAttestor "k8s_psat" {{
+                          plugin_data {{
+                            cluster = "aws-spire-cluster"
+                          }}
+                        }}
+
+                        KeyManager "memory" {{
+                          plugin_data {{
+                          }}
+                        }}
+
+                        WorkloadAttestor "k8s" {{
+                          plugin_data {{
+                            skip_kubelet_verification = true
+                            node_name_env = "MY_NODE_NAME"
+                          }}
+                        }}
+
+                        WorkloadAttestor "unix" {{
+                          plugin_data {{
+                          }}
+                        }}
+
+                        SVIDStore "aws_secretsmanager" {{
+                          plugin_data {{
+                            region = "{region}"
+                          }}
+                        }}
+                      }}
+                      health_checks {{
+                        listener_enabled = true
+                        bind_address = "0.0.0.0"
+                        bind_port = "8082"
+                        live_path = "/live"
+                        ready_path = "/ready"
+                      }}'''
+
+                  with open("spire/spire-agent.yaml", "r") as f:
+                      content = f.read()
+
+                  pattern = r'(kind: ConfigMap\nmetadata:\n  name: spire-agent\n  namespace: spire-system\ndata:\n  agent\.conf: \|)\n.*?(\n---)'
+                  replacement = r'\1\n' + new_agent_conf + r'\2'
+                  content = re.sub(pattern, replacement, content, flags=re.DOTALL)
+
+                  with open("spire/spire-agent.yaml", "w") as f:
+                      f.write(content)
+
+                  print("Agent ConfigMap updated in spire/spire-agent.yaml")
+                  PYEOF
+                - echo "=== Step 6d - Substitute SPIRE_VERSION in server and agent manifests ==="
+                - sed -i "s|ghcr.io/spiffe/spire-server:[0-9a-z.]*|ghcr.io/spiffe/spire-server:${SPIRE_VERSION}|g" spire/spire-server.yaml
+                - sed -i "s|ghcr.io/spiffe/spire-agent:[0-9a-z.]*|ghcr.io/spiffe/spire-agent:${SPIRE_VERSION}|g" spire/spire-agent.yaml
+                - echo "=== Step 6e - Customize Sample App 2 (if enabled) ==="
+                - |
+                  if [ "$DEPLOY_VERIFIED_PERMISSIONS" = "true" ]; then
+                    sed -i "s|api_endpoint = \"<>\"|api_endpoint = \"${API_ENDPOINT}\"|g" sample-app/sample-app.yaml
+                    echo "Sample App manifests customized with API endpoint."
+                  else
+                    echo "Verified Permissions disabled, skipping API endpoint substitution."
+                  fi
+                - echo "=== Step 7 - Apply SPIRE infrastructure ==="
+                - kubectl apply -k .
+                - echo "=== Step 7b - Install AWS Load Balancer Controller ==="
+                - |
+                  export CLUSTER_NAME=aws-spire-cluster
+                  export AWS_REGION=$AWS_DEFAULT_REGION
+                  chmod +x install-alb-controller.sh
+                  ./install-alb-controller.sh
+                - echo "=== Step 8 - Wait for SPIRE server readiness ==="
+                - kubectl wait --for=condition=ready pod -l app=spire-server -n spire-system --timeout=300s
+                - echo "SPIRE server is ready."
+                - echo "=== Step 8b - Create AVP Identity Source (if enabled) ==="
+                - |
+                  if [ "$DEPLOY_VERIFIED_PERMISSIONS" = "true" ]; then
+                    POLICY_STORE_ID=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="PolicyStoreId") | .OutputValue')
+                    echo "POLICY_STORE_ID=$POLICY_STORE_ID"
+
+                    # Check if an identity source already exists for this policy store
+                    EXISTING_IS=$(aws verifiedpermissions list-identity-sources \
+                      --policy-store-id "$POLICY_STORE_ID" \
+                      --query 'identitySources[0].identitySourceId' --output text 2>/dev/null || echo "None")
+
+                    if [ "$EXISTING_IS" = "None" ] || [ -z "$EXISTING_IS" ]; then
+                      echo "Creating AVP Identity Source..."
+                      IDENTITY_SOURCE_ID=$(aws verifiedpermissions create-identity-source \
+                        --policy-store-id "$POLICY_STORE_ID" \
+                        --configuration "{\"openIdConnectConfiguration\":{\"issuer\":\"https://${CLOUDFRONT_DOMAIN}\",\"tokenSelection\":{\"identityTokenOnly\":{\"clientIds\":[],\"principalIdClaim\":\"sub\"}},\"entityIdPrefix\":\"SpireApp\"}}" \
+                        --principal-entity-type "SpireApp::Workload" \
+                        --query 'identitySourceId' --output text)
+                      echo "Identity Source created: $IDENTITY_SOURCE_ID"
+                    else
+                      IDENTITY_SOURCE_ID="$EXISTING_IS"
+                      echo "Identity Source already exists: $IDENTITY_SOURCE_ID"
+                    fi
+
+                    echo "=== Step 8c - Update Lambda Authorizer with AVP IDs ==="
+                    aws lambda update-function-configuration \
+                      --function-name ${BASE_STACK_NAME}-authorizer \
+                      --environment "Variables={CLOUDFRONT_DOMAIN=${CLOUDFRONT_DOMAIN},OPENID_CONFIG_URL=https://${CLOUDFRONT_DOMAIN}/.well-known/openid-configuration,JWKS_URI=https://${CLOUDFRONT_DOMAIN}/example.org,POLICY_STORE_ID=${POLICY_STORE_ID},TRUST_DOMAIN=example.org,IDENTITY_SOURCE_ID=${IDENTITY_SOURCE_ID}}" \
+                      --query 'FunctionArn' --output text
+                    echo "Lambda authorizer updated with POLICY_STORE_ID=$POLICY_STORE_ID and IDENTITY_SOURCE_ID=$IDENTITY_SOURCE_ID"
+
+                    # Wait for the function update to complete
+                    aws lambda wait function-updated --function-name ${BASE_STACK_NAME}-authorizer
+                    echo "Lambda authorizer update complete."
+                  else
+                    echo "Verified Permissions disabled, skipping AVP and Lambda configuration."
+                  fi
+                - echo "=== Step 9 - Apply workload manifests ==="
+                - kubectl apply -f sample-app/sample-app-namespace.yaml -f sample-app/sample-app-sa.yaml -f sample-app/sample-app-rbac.yaml -f sample-app/sample-app-service.yaml -f sample-app/sample-app.yaml -f sample-app/sample-app-registration.yaml -f sample-app/sample-app-ingress.yaml
+                - echo "Sample App deployed."
+                - echo "Waiting for Sample App readiness..."
+                - kubectl wait --for=condition=ready pod -l app=sample-app -n sample-app --timeout=120s
+                - echo "Sample App is ready."
+                - echo "=== Step 10 - Configure CloudFront + Cognito Auth ==="
+                - |
+                  APP_CF_DOMAIN=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="AppCloudFrontDomain") | .OutputValue')
+                  APP_CF_DIST_ID=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="AppCloudFrontDistributionId") | .OutputValue')
+                  COGNITO_USER_POOL_ID=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="CognitoUserPoolId") | .OutputValue')
+                  COGNITO_CLIENT_ID=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="CognitoUserPoolClientId") | .OutputValue')
+                  COGNITO_DOMAIN=$(echo "$STACK_OUTPUTS" | jq -r '.[] | select(.OutputKey=="CognitoDomain") | .OutputValue')
+
+                  echo "APP_CF_DOMAIN=$APP_CF_DOMAIN"
+                  echo "APP_CF_DIST_ID=$APP_CF_DIST_ID"
+                  echo "COGNITO_CLIENT_ID=$COGNITO_CLIENT_ID"
+                  echo "COGNITO_DOMAIN=$COGNITO_DOMAIN"
+
+                  # Wait for ALB to get a DNS name
+                  echo "Waiting for ALB DNS name..."
+                  for i in $(seq 1 30); do
+                    ALB_DNS=$(kubectl get ingress sample-app-ingress -n sample-app -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "")
+                    if [ -n "$ALB_DNS" ] && [ "$ALB_DNS" != "" ]; then
+                      echo "ALB DNS: $ALB_DNS"
+                      break
+                    fi
+                    echo "Waiting for ALB... ($i/30)"
+                    sleep 10
+                  done
+
+                  if [ -z "$ALB_DNS" ]; then
+                    echo "ERROR: ALB DNS not available after 5 minutes"
+                    exit 1
+                  fi
+
+                  # Inject Cognito config into the sample app deployment
+                  echo "Injecting Cognito config into sample app..."
+                  kubectl set env deployment/sample-app -n sample-app \
+                    COGNITO_DOMAIN="$COGNITO_DOMAIN" \
+                    COGNITO_CLIENT_ID="$COGNITO_CLIENT_ID" \
+                    CLOUDFRONT_DOMAIN="$APP_CF_DOMAIN" \
+                    AWS_DEFAULT_REGION="$AWS_DEFAULT_REGION"
+
+                  # Update CloudFront distribution with real ALB origin
+                  echo "Updating CloudFront distribution with ALB origin..."
+                  python3 << CFEOF
+                  import boto3
+                  cf = boto3.client('cloudfront')
+                  dist_id = "$APP_CF_DIST_ID"
+                  alb_dns = "$ALB_DNS"
+                  resp = cf.get_distribution_config(Id=dist_id)
+                  config = resp['DistributionConfig']
+                  etag = resp['ETag']
+                  config['Origins']['Items'][0]['DomainName'] = alb_dns
+                  # Remove any Lambda@Edge associations
+                  config['DefaultCacheBehavior']['LambdaFunctionAssociations'] = {'Quantity': 0, 'Items': []}
+                  cf.update_distribution(Id=dist_id, DistributionConfig=config, IfMatch=etag)
+                  print(f"CloudFront distribution {dist_id} updated with ALB origin {alb_dns}")
+                  CFEOF
+
+                  # Update Cognito callback URLs with the CloudFront domain
+                  echo "Updating Cognito callback URLs..."
+                  aws cognito-idp update-user-pool-client \
+                    --user-pool-id "$COGNITO_USER_POOL_ID" \
+                    --client-id "$COGNITO_CLIENT_ID" \
+                    --callback-urls "https://${APP_CF_DOMAIN}/auth/callback" \
+                    --logout-urls "https://${APP_CF_DOMAIN}/auth/logout" \
+                    --allowed-o-auth-flows code \
+                    --allowed-o-auth-scopes openid email profile \
+                    --allowed-o-auth-flows-user-pool-client \
+                    --supported-identity-providers COGNITO \
+                    --query 'UserPoolClient.ClientId' --output text
+                  echo "Cognito callback URLs updated."
+
+                  echo "App URL: https://${APP_CF_DOMAIN}"
+                - echo "=== Setup complete ==="
+      Artifacts:
+        Type: NO_ARTIFACTS
+
+Outputs:
+  SetupProjectName:
+    Description: Name of the CodeBuild project to trigger
+    Value: !Ref SetupProject
+  CodeBuildRoleArn:
+    Description: ARN of the CodeBuild IAM role
+    Value: !GetAtt CodeBuildRole.Arn
