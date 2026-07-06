@@ -10,7 +10,7 @@ This repository contains the infrastructure and Kubernetes manifests for deployi
 A sample workload is provisioned that displays the workload's SPIFFE identity (X.509 and JWT SVIDs) and demonstrates the end-to-end authorization flow through API Gateway and Verified Permissions. The stack will provision also provision a Cognito User Pool and test user to access the web application in addition to the infrastructure supporting the SPIRE system.
 
 
-## What it does
+## What this repository changes about the default SPIRE deployment
 
 The default SPIRE deployment handles key management, data storage, and certificate authority functions internally. This repo enables you to offload those functions to AWS managed services:
 
@@ -21,7 +21,6 @@ The default SPIRE deployment handles key management, data storage, and certifica
 | Certificate Authority | AWS Private CA | HSM-backed root of trust, managed CRL/OCSP |
 | Trust Bundle Publisher | Amazon S3 + CloudFront | Global bundle distribution decoupled from SPIRE server |
 | SVID Store (Agent) | AWS Secrets Manager | Push SVIDs to serverless/ephemeral workloads |
-|
 
 ![Architecture](images/Architecture.png)
 
@@ -58,8 +57,7 @@ REGION=<your-region>
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
 BUCKET=spire-templates-${ACCOUNT_ID}-${REGION}
 
-aws s3api create-bucket --bucket $BUCKET --region $REGION \
-  --create-bucket-configuration LocationConstraint=$REGION
+aws s3api create-bucket --bucket $BUCKET --region $REGION
 
 aws cloudformation deploy \
   --template-file spiffe.yaml \
