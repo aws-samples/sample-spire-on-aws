@@ -21,7 +21,7 @@ The default SPIRE deployment handles key management, data storage, and certifica
 | Certificate Authority | AWS Private CA | HSM-backed root of trust, managed CRL/OCSP |
 | Trust Bundle Publisher | Amazon S3 + CloudFront | Global bundle distribution decoupled from SPIRE server |
 | SVID Store (Agent) | AWS Secrets Manager | Push SVIDs to serverless/ephemeral workloads |
-
+|
 
 ![Architecture](images/Architecture.png)
 

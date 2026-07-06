@@ -1,4 +1,5 @@
 resources:
+- storage-class.yaml
 - spire/spiffe-csi-driver.yaml
 - spire/spire-namespace.yaml
 - crd/spire.spiffe.io_clusterfederatedtrustdomains.yaml
