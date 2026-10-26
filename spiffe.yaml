@@ -610,7 +610,7 @@ Resources:
     Condition: ShouldDeployRDS
     Properties:
       Engine: aurora-postgresql
-      EngineVersion: '16.6'
+      EngineVersion: '16.15'
       MasterUsername: masteruser
       ManageMasterUserPassword: true
       DBSubnetGroupName: !Ref DBSubnetGroup
@@ -1151,6 +1151,10 @@ Resources:
         - email
       UsernameAttributes:
         - email
+      # Disable public self sign-up: only the stack's demo-user Lambda
+      # (which calls AdminCreateUser) may provision accounts.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
       Policies:
         PasswordPolicy:
           MinimumLength: 16
