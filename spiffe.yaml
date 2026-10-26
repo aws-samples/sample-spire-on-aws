@@ -610,7 +610,7 @@ Resources:
     Condition: ShouldDeployRDS
     Properties:
       Engine: aurora-postgresql
-      EngineVersion: '16.6'
+      EngineVersion: '16.15'
       MasterUsername: masteruser
       ManageMasterUserPassword: true
       DBSubnetGroupName: !Ref DBSubnetGroup
